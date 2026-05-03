@@ -285,6 +285,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 .drop-zone .hint { font-size: 0.75rem; color: #94a3b8; margin-top: 4px; }
 .drop-zone input { display: none; }
 .file-name { margin-top: 12px; font-size: 0.85rem; color: #3b82f6; text-align: center; display: none; }
+.preview-img { display: none; max-width: 100%; max-height: 280px; margin: 16px auto 0; border-radius: 8px; border: 1px solid #e2e8f0; box-shadow: 0 2px 8px rgba(0,0,0,0.06); object-fit: contain; }
 .btn { display: block; width: 100%; padding: 12px; background: #3b82f6; color: white; border: none; border-radius: 8px; font-size: 0.95rem; font-weight: 500; cursor: pointer; margin-top: 16px; transition: background 0.2s; }
 .btn:hover { background: #2563eb; }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
@@ -331,6 +332,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
       <div class="hint">PNG, JPG, PDF &bull; Max 10MB</div>
       <input type="file" id="fileInput" accept="image/*,.pdf">
     </div>
+    <img class="preview-img" id="previewImg" alt="Document preview">
     <div class="file-name" id="fileName"></div>
     <button class="btn" id="processBtn" disabled>
       <span id="btnText">Select a file to begin</span>
@@ -361,6 +363,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 const dropZone = document.getElementById('dropZone');
 const fileInput = document.getElementById('fileInput');
 const fileName = document.getElementById('fileName');
+const previewImg = document.getElementById('previewImg');
 const processBtn = document.getElementById('processBtn');
 const btnText = document.getElementById('btnText');
 const spinner = document.getElementById('spinner');
@@ -385,6 +388,16 @@ function setFile(file) {
   processBtn.disabled = false;
   btnText.textContent = 'Process Document';
   errorBox.style.display = 'none';
+
+  if (file.type.startsWith('image/')) {
+    const url = URL.createObjectURL(file);
+    previewImg.src = url;
+    previewImg.style.display = 'block';
+    if (previewImg._prevUrl) URL.revokeObjectURL(previewImg._prevUrl);
+    previewImg._prevUrl = url;
+  } else {
+    previewImg.style.display = 'none';
+  }
 }
 
 function formatSize(bytes) {
