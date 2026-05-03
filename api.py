@@ -64,15 +64,16 @@ async def _process_image(image: np.ndarray, raw_bytes: bytes, language: str = "e
         extraction_warnings.append("low_scan_quality")
 
     result = None
+    ocr_text = None
 
     if EXTRACTION_MODE in ("hybrid", "vision") and OPENROUTER_KEY:
         result = await _try_vision_extraction(raw_bytes, extraction_warnings)
 
     if not result and EXTRACTION_MODE in ("hybrid", "llm") and OPENROUTER_KEY and OCR_SPACE_KEY:
-        result = await _try_llm_text_extraction(image, extraction_warnings, language)
+        result, ocr_text = await _try_llm_text_extraction(image, extraction_warnings, language)
 
     if not result:
-        result = await _try_regex_extraction(image, extraction_warnings, language)
+        result = await _try_regex_extraction(image, extraction_warnings, language, ocr_text)
 
     result.extraction_warnings.extend(quality_warnings)
     return result
@@ -112,8 +113,8 @@ async def _try_vision_extraction(raw_bytes: bytes, warnings: list[str]) -> Optio
     )
 
 
-async def _try_llm_text_extraction(image: np.ndarray, warnings: list[str], language: str) -> Optional[ExtractionResult]:
-    """Tier 2: OCR → classify → text LLM extract."""
+async def _try_llm_text_extraction(image: np.ndarray, warnings: list[str], language: str) -> tuple[Optional[ExtractionResult], Optional[str]]:
+    """Tier 2: OCR → classify → text LLM extract. Returns (result, ocr_text)."""
     logger.info("Tier 2: Attempting OCR + text LLM extraction")
     processed = preprocess_image(image)
 
@@ -121,20 +122,20 @@ async def _try_llm_text_extraction(image: np.ndarray, warnings: list[str], langu
         ocr_result = await ocr_extract_text(processed, ocr_space_key=OCR_SPACE_KEY, openrouter_key=OPENROUTER_KEY, language=language)
     except Exception as e:
         logger.warning(f"OCR failed: {e}")
-        return None
+        return None, None
 
     text = safe_log(ocr_result.text)
     logger.info(f"OCR extracted {len(text)} chars")
 
     doc_type, cls_conf = classify_document(text, image.shape)
     if not doc_type:
-        return None
+        return None, text
 
     try:
         data = await extract_from_text(text, doc_type)
     except Exception as e:
         logger.warning(f"Text LLM extraction failed: {e}")
-        return None
+        return None, text
 
     fields = data.get("fields", {})
     llm_confidence = data.get("confidence", cls_conf)
@@ -155,21 +156,24 @@ async def _try_llm_text_extraction(image: np.ndarray, warnings: list[str], langu
         masked=masked,
         extraction_warnings=list(warnings),
         field_confidences=_build_field_confidences(fields),
-    )
+    ), text
 
 
-async def _try_regex_extraction(image: np.ndarray, warnings: list[str], language: str) -> ExtractionResult:
+async def _try_regex_extraction(image: np.ndarray, warnings: list[str], language: str, cached_ocr_text: Optional[str] = None) -> ExtractionResult:
     """Tier 3: OCR → classify → regex extract (legacy fallback)."""
     logger.info("Tier 3: Falling back to regex extraction")
-    processed = preprocess_image(image)
 
-    try:
-        ocr_result = await ocr_extract_text(processed, ocr_space_key=OCR_SPACE_KEY, openrouter_key=OPENROUTER_KEY, language=language)
-    except OCRError as e:
-        raise HTTPException(status_code=502, detail=f"OCR service unavailable: {e}")
-
-    text = safe_log(ocr_result.text)
-    logger.info(f"Extracted text ({len(text)} chars)")
+    if cached_ocr_text:
+        text = cached_ocr_text
+        logger.info(f"Reusing OCR text from Tier 2 ({len(text)} chars)")
+    else:
+        processed = preprocess_image(image)
+        try:
+            ocr_result = await ocr_extract_text(processed, ocr_space_key=OCR_SPACE_KEY, openrouter_key=OPENROUTER_KEY, language=language)
+        except OCRError as e:
+            raise HTTPException(status_code=502, detail=f"OCR service unavailable: {e}")
+        text = safe_log(ocr_result.text)
+        logger.info(f"Extracted text ({len(text)} chars)")
 
     doc_type, confidence = classify_document(text, image.shape)
     if not doc_type:

@@ -11,7 +11,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_VISION_MODEL = "google/gemma-4-31b-it:free"
+DEFAULT_VISION_MODEL = "google/gemini-2.0-flash-001"
 DEFAULT_TEXT_MODEL = "qwen/qwen3-coder:free"
 
 VISION_PROMPT = """You are a KYC document extraction system. Analyze this Indian identity document image carefully.
@@ -80,23 +80,31 @@ def _get_api_key() -> Optional[str]:
 
 
 def _parse_llm_response(content: str) -> dict:
-    """Parse the LLM response, handling markdown code fences."""
+    """Parse LLM response, handling various output formats robustly."""
     text = content.strip()
+
     if text.startswith("```"):
         lines = text.split("\n")
         lines = [l for l in lines if not l.startswith("```")]
         text = "\n".join(lines).strip()
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start >= 0 and end > start:
+        json_text = text[start:end + 1]
+        try:
+            return json.loads(json_text)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start >= 0 and end > start:
-            try:
-                return json.loads(text[start:end + 1])
-            except json.JSONDecodeError:
-                pass
-        return {"document_type": None, "confidence": 0.0, "fields": {}, "extraction_warnings": ["llm_parse_failed"]}
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    logger.warning(f"LLM returned unparseable response: {content[:200]}...")
+    return {"document_type": None, "confidence": 0.0, "fields": {}, "extraction_warnings": ["llm_parse_failed"]}
 
 
 async def extract_with_vision(image_bytes: bytes, api_key: Optional[str] = None) -> dict:
