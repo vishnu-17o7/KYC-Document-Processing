@@ -1,0 +1,106 @@
+# KYC Document Processing Pipeline — Architecture Write-up
+
+## Overview
+
+This pipeline automates the extraction of structured data from scanned Indian identity documents. It accepts images or PDFs, identifies the document type, extracts fields, validates them, applies masking, and returns a clean JSON response — all via a REST API.
+
+## Architecture Decisions
+
+### 1. Cloud OCR over Local Processing
+
+**Decision:** Use OCR.space (primary) + OpenRouter Baidu Qianfan-OCR (fallback) instead of local EasyOCR or Tesseract.
+
+**Rationale:**
+- Zero system dependencies — no Tesseract binary, no EasyOCR model downloads (~1GB)
+- ocr.space has a generous free tier (25,000 req/month, 500/day) and supports Hindi via engine auto-detection
+- OpenRouter's `baidu/qianfan-ocr-fast:free` provides a purpose-built vision OCR model at zero cost (~200 req/day limit)
+- Dual-API architecture provides resilience — if one service is rate-limited or down, the other takes over
+- Both APIs are truly free — no credit card required
+
+**Trade-off:** Adds network latency (~500ms-2s per document) versus local processing's instant response. For a server-side processing pipeline, this is acceptable.
+
+### 2. Keyword + Layout Classification over ML Models
+
+**Decision:** Heuristic classification using keyword matching and image layout signals rather than training a vision classifier.
+
+**Rationale:**
+- Indian identity documents have highly distinctive text signatures (AADHAAR, UIDAI, PERMANENT ACCOUNT NUMBER, etc.) that are reliably detected in OCR output
+- Layout features (aspect ratio, text density) add signal without requiring model training
+- No training data or GPU needed
+- Classifier runs in <1ms post-OCR
+- Confidence scores degrade gracefully with fewer keyword matches
+
+**Trade-off:** May struggle with heavily corrupted scans where OCR fails to pick up any keywords. The fallback is a graceful 400 rejection rather than a wrong classification.
+
+### 3. Per-Document Extractor Pattern
+
+**Decision:** Each document type gets its own extractor class implementing a common `BaseExtractor` interface.
+
+**Rationale:**
+- Clean separation of concerns — Aadhaar extraction logic doesn't leak into PAN extraction
+- Easy to add new document types — just add a new extractor and register it
+- Each extractor can use document-specific regex patterns (Aadhaar has Hindi name patterns, Passport has MRZ)
+- Field-level confidence scoring is per-extractor and can be tuned independently
+
+### 4. Masking at the Serialization Boundary
+
+**Decision:** Aadhaar masking is enforced as a post-processing decorator pattern applied after extraction but before JSON serialization.
+
+**How it works:**
+1. OCR extracts the full Aadhaar number (12 digits)
+2. Internal validation (Verhoeff checksum) uses unmasked digits for accuracy
+3. `mask_fields()` replaces first 8 digits with `XXXX XXXX` before the response is built
+4. `safe_log()` scrubs Aadhaar numbers from all log messages
+5. Unmasked digits never touch any serialized output or log
+
+**Guarantee:** The only place unmasked digits exist is in local variable scope during extraction/validation. They are never in API responses, log files, or error messages.
+
+### 5. Preprocessing Pipeline for Real-World Scans
+
+**Decision:** OpenCV-based preprocessing (deskew, CLAHE contrast enhancement, OTSU binarization) before OCR.
+
+**Rationale:**
+- Deskewing corrects rotated scans (common with mobile phone captures)
+- CLAHE (Contrast Limited Adaptive Histogram Equalization) handles uneven lighting
+- Bilateral filtering removes noise while preserving edges
+- OTSU automatic thresholding produces clean binary images for OCR
+
+### 6. MRZ Validation as Cross-Check
+
+For passports, the Machine Readable Zone (MRZ) provides a structured, machine-readable encoding of the biographical data. The pipeline:
+1. Extracts fields from the visual zone (Name, DOB, Passport No, etc.)
+2. Parses the 2-line MRZ to extract the same fields
+3. Cross-validates passport numbers and DOBs between both sources
+4. Reports `mrz_passport_mismatch` or `mrz_dob_mismatch` warnings when they differ
+
+This provides a defense against OCR errors in the visual zone.
+
+## API Quick Start
+
+```bash
+# Start the server
+python api.py
+
+# Extract a document
+curl -X POST http://localhost:8000/extract \
+  -F "file=@aadhaar_scan.png"
+
+# Health check
+curl http://localhost:8000/health
+```
+
+## Configuration
+
+Set environment variables in `.env`:
+```
+OCR_SPACE_API_KEY=K8674...    # Free from https://ocr.space/ocrapi/freekey
+OPENROUTER_API_KEY=sk-or-...  # Optional, from https://openrouter.ai/keys
+```
+
+Only `OCR_SPACE_API_KEY` is required. The pipeline falls back to OpenRouter only if both keys are provided and ocr.space fails.
+
+## Test Coverage
+
+- **44 unit tests** covering classifier, all 5 extractors, validators, masking, preprocessing, and end-to-end pipelines
+- **4 synthetic test documents** generated by `tests/generate_test_docs.py`: clean Aadhaar, degraded Aadhaar (skew + blur + noise), clean PAN, clean Driving Licence
+- All tests are API-free — they validate the extraction and validation logic against known text inputs without network calls
